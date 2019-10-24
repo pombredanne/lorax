@@ -24,29 +24,80 @@ log = logging.getLogger("lorax")
 dnf_log = logging.getLogger("dnf")
 
 
+import atexit
+import fcntl
+from glob import glob
 import sys
 import os
 import tempfile
 import shutil
 
 import dnf
+import dnf.logging
+import librepo
 import pylorax
+from pylorax import DRACUT_DEFAULT, log_selinux_state
 from pylorax.cmdline import lorax_parser
+from pylorax.dnfbase import get_dnf_base_object
+
+def exit_handler(tempdir):
+    """Handle cleanup of tmpdir, if it still exists
+    """
+    if not tempdir:
+        return
+    if os.path.exists(tempdir):
+        log.info("Cleaning up tempdir - %s", tempdir)
+        shutil.rmtree(tempdir)
+
+
+def remove_tempdirs():
+    """Delete all unlocked tempdirs under tempfile.gettempdir
+
+    When lorax crashes it can leave behind tempdirs, which cannot be cleaned up by
+    systemd-tmpfiles (SELinux restricts a complete cleanup).
+
+    So we lock them while in use and cleanup all the ones that are not locked
+    when lorax starts.
+    """
+    for d in glob(os.path.join(tempfile.gettempdir(), "lorax.*")):
+        if not os.path.isdir(d):
+            continue
+        try:
+            dir_fd = os.open(d, os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+            fcntl.flock(dir_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # lock failed, skip this directory
+            os.close(dir_fd)
+            continue
+
+        # Lock succeeded, remove the directory
+        log.info("Removing old tempdir %s", d)
+        shutil.rmtree(d)
+        os.close(dir_fd)
+
 
 def setup_logging(opts):
     pylorax.setup_logging(opts.logfile, log)
 
     # dnf logging
-    dnf_log.setLevel(logging.DEBUG)
+    dnf_log.setLevel(dnf.logging.DDEBUG)
     logfile = os.path.abspath(os.path.dirname(opts.logfile))+"/dnf.log"
     fh = logging.FileHandler(filename=logfile, mode="w")
-    fh.setLevel(logging.DEBUG)
+    fh.setLevel(logging.NOTSET)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+    fh.setFormatter(fmt)
     dnf_log.addHandler(fh)
+
+    # Setup librepo logging
+    logfile = os.path.abspath(os.path.dirname(opts.logfile))+"/dnf.librepo.log"
+    librepo.log_set_file(logfile)
 
 
 def main():
-    parser = lorax_parser()
+    parser = lorax_parser(DRACUT_DEFAULT)
     opts = parser.parse_args()
+
+    log.info("Lorax v%s", pylorax.vernum)
 
     if not opts.source and not opts.repos:
         parser.error("--source, --repo, or both are required.")
@@ -58,18 +109,36 @@ def main():
         os.makedirs(os.path.dirname(opts.logfile))
     if opts.sharedir and not os.path.isdir(opts.sharedir):
         parser.error("sharedir %s doesn't exist." % opts.sharedir)
+    if opts.config and not os.path.exists(opts.config):
+        parser.error("config file %s doesn't exist." % opts.config)
 
     setup_logging(opts)
+    log.debug(opts)
+
+    log_selinux_state()
 
     if not opts.workdir:
+        if not os.path.exists(opts.tmp):
+            os.makedirs(opts.tmp)
+
         tempfile.tempdir = opts.tmp
 
+        # Remove any orphaned lorax tempdirs
+        remove_tempdirs()
+
         # create the temporary directory for lorax
-        tempdir = tempfile.mkdtemp(prefix="lorax.", dir=tempfile.gettempdir())
+        tempdir = tempfile.mkdtemp(prefix="lorax.")
+
+        # register an exit handler to cleanup the temporary directory
+        atexit.register(exit_handler, tempdir)
     else:
+        # NOTE: workdir is not cleaned up on exit
         tempdir = opts.workdir
         if not os.path.exists(tempdir):
             os.makedirs(tempdir)
+
+        # Remove any orphaned lorax tempdirs
+        remove_tempdirs()
 
     installtree = os.path.join(tempdir, "installtree")
     if not os.path.exists(installtree):
@@ -78,14 +147,19 @@ def main():
     if not os.path.exists(dnftempdir):
         os.mkdir(dnftempdir)
 
+    # Obtain an exclusive lock on the tempdir
+    dir_fd = os.open(tempdir, os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+    fcntl.flock(dir_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     dnfbase = get_dnf_base_object(installtree, opts.source, opts.mirrorlist, opts.repos,
                                   opts.enablerepos, opts.disablerepos,
-                                  dnftempdir, opts.proxy, opts.version, opts.cachedir)
+                                  dnftempdir, opts.proxy, opts.version, opts.cachedir,
+                                  os.path.dirname(opts.logfile), not opts.noverifyssl,
+                                  opts.dnfplugins)
 
     if dnfbase is None:
+        os.close(dir_fd)
         print("error: unable to create the dnf base object", file=sys.stderr)
-        if not opts.workdir:
-            shutil.rmtree(tempdir)
         sys.exit(1)
 
     parsed_add_template_vars = {}
@@ -102,6 +176,9 @@ def main():
             raise ValueError("Missing '=' for key=value in " % kv)
         parsed_add_arch_template_vars[k] = v
 
+    if 'SOURCE_DATE_EPOCH' in os.environ:
+        log.info("Using SOURCE_DATE_EPOCH=%s as the current time.", os.environ["SOURCE_DATE_EPOCH"])
+
     # run lorax
     lorax = pylorax.Lorax()
     lorax.configure(conf_file=opts.config)
@@ -111,157 +188,25 @@ def main():
     if opts.sharedir:
         lorax.conf.set("lorax", "sharedir", opts.sharedir)
 
+    with open(lorax.conf.get("lorax", "logdir") + '/lorax.conf', 'w') as f:
+        lorax.conf.write(f)
+
     lorax.run(dnfbase, opts.product, opts.version, opts.release,
               opts.variant, opts.bugurl, opts.isfinal,
               workdir=tempdir, outputdir=opts.outputdir, buildarch=opts.buildarch,
               volid=opts.volid, domacboot=opts.domacboot, doupgrade=opts.doupgrade,
-              installpkgs=opts.installpkgs,
+              installpkgs=opts.installpkgs, excludepkgs=opts.excludepkgs,
+              size=opts.rootfs_size,
               add_templates=opts.add_templates,
               add_template_vars=parsed_add_template_vars,
               add_arch_templates=opts.add_arch_templates,
               add_arch_template_vars=parsed_add_arch_template_vars,
-              remove_temp=True, verify=opts.verify)
+              remove_temp=True, verify=opts.verify,
+              user_dracut_args=opts.dracut_args,
+              squashfs_only=opts.squashfs_only)
 
-
-def get_dnf_base_object(installroot, sources, mirrorlists=None, repos=None,
-                        enablerepos=None, disablerepos=None,
-                        tempdir="/var/tmp", proxy=None, releasever="21",
-                        cachedir=None):
-    """ Create a dnf Base object and setup the repositories and installroot
-
-        :param string installroot: Full path to the installroot
-        :param list sources: List of source repo urls to use for the installation
-        :param list enablerepos: List of repo names to enable
-        :param list disablerepos: List of repo names to disable
-        :param list mirrorlist: List of mirrors to use
-        :param string tempdir: Path of temporary directory
-        :param string proxy: http proxy to use when fetching packages
-        :param string releasever: Release version to pass to dnf
-        :param string cachedir: Directory to use for caching packages
-
-        If tempdir is not set /var/tmp is used.
-        If cachedir is None a dnf.cache directory is created inside tmpdir
-    """
-    def sanitize_repo(repo):
-        """Convert bare paths to file:/// URIs, and silently reject protocols unhandled by yum"""
-        if repo.startswith("/"):
-            return "file://{0}".format(repo)
-        elif any(repo.startswith(p) for p in ('http://', 'https://', 'ftp://', 'file://')):
-            return repo
-        else:
-            return None
-
-    mirrorlists = mirrorlists or []
-
-    # sanitize the repositories
-    sources = list(sanitize_repo(r) for r in sources)
-    mirrorlists = list(sanitize_repo(r) for r in mirrorlists)
-
-    # remove invalid repositories
-    sources = list(r for r in sources if r)
-    mirrorlists = list(r for r in mirrorlists if r)
-
-    if not cachedir:
-        cachedir = os.path.join(tempdir, "dnf.cache")
-    if not os.path.isdir(cachedir):
-        os.mkdir(cachedir)
-
-    logdir = os.path.join(tempdir, "dnf.logs")
-    if not os.path.isdir(logdir):
-        os.mkdir(logdir)
-
-    dnfbase = dnf.Base()
-    conf = dnfbase.conf
-    conf.logdir = logdir
-    conf.cachedir = cachedir
-
-    # Turn off logging to the console
-    conf.debuglevel = 10
-    conf.errorlevel = 0
-    dnfbase.logging.setup_from_dnf_conf(conf)
-
-    conf.install_weak_deps = False
-    conf.releasever = releasever
-    conf.installroot = installroot
-    conf.prepend_installroot('persistdir')
-    conf.tsflags.append('nodocs')
-
-    if proxy:
-        conf.proxy = proxy
-
-    # Add .repo files
-    if repos:
-        reposdir = os.path.join(tempdir, "dnf.repos")
-        if not os.path.isdir(reposdir):
-            os.mkdir(reposdir)
-        for r in repos:
-            shutil.copy2(r, reposdir)
-        conf.reposdir = [reposdir]
-        dnfbase.read_all_repos()
-
-    # add the sources
-    for i, r in enumerate(sources):
-        if "SRPM" in r or "srpm" in r:
-            log.info("Skipping source repo: %s", r)
-            continue
-        repo_name = "lorax-repo-%d" % i
-        repo = dnf.repo.Repo(repo_name, cachedir)
-        repo.baseurl = [r]
-        if proxy:
-            repo.proxy = proxy
-        repo.enable()
-        dnfbase.repos.add(repo)
-        log.info("Added '%s': %s", repo_name, r)
-        log.info("Fetching metadata...")
-        try:
-            repo.load()
-        except dnf.exceptions.RepoError as e:
-            log.error("Error fetching metadata for %s: %s", repo_name, e)
-            return None
-
-    # add the mirrorlists
-    for i, r in enumerate(mirrorlists):
-        if "SRPM" in r or "srpm" in r:
-            log.info("Skipping source repo: %s", r)
-            continue
-        repo_name = "lorax-mirrorlist-%d" % i
-        repo = dnf.repo.Repo(repo_name, cachedir)
-        repo.mirrorlist = r
-        if proxy:
-            repo.proxy = proxy
-        repo.enable()
-        dnfbase.repos.add(repo)
-        log.info("Added '%s': %s", repo_name, r)
-        log.info("Fetching metadata...")
-        try:
-            repo.load()
-        except dnf.exceptions.RepoError as e:
-            log.error("Error fetching metadata for %s: %s", repo_name, e)
-            return None
-
-    # Enable repos listed on the cmdline
-    for r in enablerepos:
-        repolist = dnfbase.repos.get_matching(r)
-        if not repolist:
-            log.warning("%s is an unknown repo, not enabling it", r)
-        else:
-            repolist.enable()
-            log.info("Enabled repo %s", r)
-
-    # Disable repos listed on the cmdline
-    for r in disablerepos:
-        repolist = dnfbase.repos.get_matching(r)
-        if not repolist:
-            log.warning("%s is an unknown repo, not disabling it", r)
-        else:
-            repolist.disable()
-            log.info("Disabled repo %s", r)
-
-    dnfbase.fill_sack(load_system_repo=False)
-    dnfbase.read_comps()
-
-    return dnfbase
-
+    # Release the lock on the tempdir
+    os.close(dir_fd)
 
 if __name__ == "__main__":
     main()

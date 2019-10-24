@@ -49,14 +49,24 @@ from pylorax.treeinfo import TreeInfo
 from pylorax.discinfo import DiscInfo
 from pylorax.executils import runcmd, runcmd_output
 
-# List of drivers to remove on ppc64 arch to keep initrd < 32MiB
-REMOVE_PPC64_DRIVERS = "floppy scsi_debug nouveau radeon cirrus mgag200"
-REMOVE_PPC64_MODULES = "drm plymouth"
+
+# get lorax version
+try:
+    import pylorax.version
+except ImportError:
+    vernum = "devel"
+else:
+    vernum = pylorax.version.num
+
+DRACUT_DEFAULT = ["--xz", "--install", "/.buildstamp", "--no-early-microcode", "--add", "fips"]
+
+# Used for DNF conf.module_platform_id
+DEFAULT_PLATFORM_ID = "platform:f32"
 
 class ArchData(DataHolder):
-    lib64_arches = ("x86_64", "ppc64", "ppc64le", "s390x", "ia64", "aarch64")
+    lib64_arches = ("x86_64", "ppc64le", "s390x", "ia64", "aarch64")
     bcj_arch = dict(i386="x86", x86_64="x86",
-                    ppc="powerpc", ppc64="powerpc", ppc64le="powerpc",
+                    ppc64le="powerpc",
                     arm="arm", armhfp="arm")
 
     def __init__(self, buildarch):
@@ -165,25 +175,20 @@ class Lorax(BaseLoraxClass):
     def run(self, dbo, product, version, release, variant="", bugurl="",
             isfinal=False, workdir=None, outputdir=None, buildarch=None, volid=None,
             domacboot=True, doupgrade=True, remove_temp=False,
-            installpkgs=None,
+            installpkgs=None, excludepkgs=None,
             size=2,
             add_templates=None,
             add_template_vars=None,
             add_arch_templates=None,
             add_arch_template_vars=None,
-            verify=True):
+            verify=True,
+            user_dracut_args=None,
+            squashfs_only=False):
 
         assert self._configured
 
         installpkgs = installpkgs or []
-
-        # get lorax version
-        try:
-            import pylorax.version
-        except ImportError:
-            vernum = "devel"
-        else:
-            vernum = pylorax.version.num
+        excludepkgs = excludepkgs or []
 
         if domacboot:
             try:
@@ -206,6 +211,8 @@ class Lorax(BaseLoraxClass):
         self.init_file_logging(logdir)
 
         logger.debug("version is %s", vernum)
+        log_selinux_state()
+
         logger.debug("using work directory %s", self.workdir)
         logger.debug("using log directory %s", logdir)
 
@@ -219,22 +226,6 @@ class Lorax(BaseLoraxClass):
         logger.info("checking for root privileges")
         if not os.geteuid() == 0:
             logger.critical("no root privileges")
-            sys.exit(1)
-
-        # is selinux disabled?
-        # With selinux in enforcing mode the rpcbind package required for
-        # dracut nfs module, which is in turn required by anaconda module,
-        # will not get installed, because it's preinstall scriptlet fails,
-        # resulting in an incomplete initial ramdisk image.
-        # The reason is that the scriptlet runs tools from the shadow-utils
-        # package in chroot, particularly groupadd and useradd to add the
-        # required rpc group and rpc user. This operation fails, because
-        # the selinux context on files in the chroot, that the shadow-utils
-        # tools need to access (/etc/group, /etc/passwd, /etc/shadow etc.),
-        # is wrong and selinux therefore disallows access to these files.
-        logger.info("checking the selinux mode")
-        if selinux.is_selinux_enabled() and selinux.security_getenforce():
-            logger.critical("selinux must be disabled or in Permissive mode")
             sys.exit(1)
 
         # do we have a proper dnf base object?
@@ -270,6 +261,7 @@ class Lorax(BaseLoraxClass):
         rb = RuntimeBuilder(product=self.product, arch=self.arch,
                             dbo=dbo, templatedir=self.templatedir,
                             installpkgs=installpkgs,
+                            excludepkgs=excludepkgs,
                             add_templates=add_templates,
                             add_template_vars=add_template_vars)
 
@@ -278,7 +270,8 @@ class Lorax(BaseLoraxClass):
 
         # write .buildstamp
         buildstamp = BuildStamp(self.product.name, self.product.version,
-                                self.product.bugurl, self.product.isfinal, self.arch.buildarch)
+                                self.product.bugurl, self.product.isfinal,
+                                self.arch.buildarch, self.product.variant)
 
         buildstamp.write(joinpaths(self.inroot, ".buildstamp"))
 
@@ -322,9 +315,16 @@ class Lorax(BaseLoraxClass):
                 compressargs += ["-Xbcj", self.arch.bcj]
             else:
                 logger.info("no BCJ filter for arch %s", self.arch.basearch)
-        rb.create_runtime(joinpaths(installroot,runtime),
-                          compression=compression, compressargs=compressargs,
-                          size=size)
+        if squashfs_only:
+            # Create an ext4 rootfs.img and compress it with squashfs
+            rb.create_squashfs_runtime(joinpaths(installroot,runtime),
+                compression=compression, compressargs=compressargs,
+                size=size)
+        else:
+            # Create an ext4 rootfs.img and compress it with squashfs
+            rb.create_ext4_runtime(joinpaths(installroot,runtime),
+                compression=compression, compressargs=compressargs,
+                size=size)
         rb.finished()
 
         logger.info("preparing to build output tree and boot images")
@@ -338,17 +338,17 @@ class Lorax(BaseLoraxClass):
                                   workdir=self.workdir)
 
         logger.info("rebuilding initramfs images")
-        dracut_args = ["--xz", "--install", "/.buildstamp", "--no-early-microcode"]
+        if not user_dracut_args:
+            dracut_args = DRACUT_DEFAULT
+        else:
+            dracut_args = []
+            for arg in user_dracut_args:
+                dracut_args += arg.split(" ", 1)
+
         anaconda_args = dracut_args + ["--add", "anaconda pollcdrom qemu qemu-net"]
 
-        # ppc64 cannot boot an initrd > 32MiB so remove some drivers
-        if self.arch.basearch in ("ppc64", "ppc64le"):
-            dracut_args.extend(["--omit-drivers", REMOVE_PPC64_DRIVERS])
-
-            # Only omit dracut modules from the initrd so that they're kept for
-            # upgrade.img
-            anaconda_args.extend(["--omit", REMOVE_PPC64_MODULES])
-
+        logger.info("dracut args = %s", dracut_args)
+        logger.info("anaconda args = %s", anaconda_args)
         treebuilder.rebuild_initrds(add_args=anaconda_args)
 
         logger.info("populating output tree and building boot images")
@@ -371,12 +371,12 @@ def get_buildarch(dbo):
     buildarch = None
     q = dbo.sack.query()
     a = q.available()
-    for anaconda in a.filter(name="anaconda"):
+    for anaconda in a.filter(name="anaconda-core"):
         if anaconda.arch != "src":
             buildarch = anaconda.arch
             break
     if not buildarch:
-        logger.critical("no anaconda package in the repository")
+        logger.critical("no anaconda-core package in the repository")
         sys.exit(1)
 
     return buildarch
@@ -417,6 +417,8 @@ def setup_logging(logfile, theLogger):
     f = os.path.abspath(os.path.dirname(logfile))+"/program.log"
     fh = logging.FileHandler(filename=f, mode="w")
     fh.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+    fh.setFormatter(fmt)
     program_log.addHandler(fh)
 
 
@@ -438,3 +440,13 @@ def find_templates(templatedir="/usr/share/lorax"):
         except IndexError:
             pass
     return templatedir
+
+def log_selinux_state():
+    """Log the current state of selinux"""
+    if selinux.is_selinux_enabled():
+        if selinux.security_getenforce():
+            logger.info("selinux is enabled and in Enforcing mode")
+        else:
+            logger.info("selinux is enabled and in Permissive mode")
+    else:
+        logger.info("selinux is Disabled")

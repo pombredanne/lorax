@@ -14,8 +14,6 @@ url --url="http://dl.fedoraproject.org/pub/fedora/linux/development/rawhide/Ever
 # Network information
 network  --bootproto=dhcp --device=link --activate
 
-# System authorization information
-auth --useshadow --passalgo=sha512
 # SELinux configuration
 selinux --enforcing
 
@@ -30,6 +28,7 @@ bootloader --location=none
 clearpart --all --initlabel
 rootpw rootme
 # Disk partitioning information
+reqpart
 part / --size=6656
 
 %post
@@ -176,6 +175,10 @@ systemctl --no-reload disable atd.service 2> /dev/null || :
 systemctl stop crond.service 2> /dev/null || :
 systemctl stop atd.service 2> /dev/null || :
 
+# turn off abrtd on a live image
+systemctl --no-reload disable abrtd.service 2> /dev/null || :
+systemctl stop abrtd.service 2> /dev/null || :
+
 # Don't sync the system clock when running live (RHBZ #1018162)
 sed -i 's/rtcsync//' /etc/chrony.conf
 
@@ -292,16 +295,6 @@ rm /var/lib/systemd/random-seed
 rm -f /boot/*-rescue*
 %end
 
-%post --nochroot
-cp $INSTALL_ROOT/usr/share/licenses/*-release/* $LIVE_ROOT/
-
-# only works on x86, x86_64
-if [ "$(uname -i)" = "i386" -o "$(uname -i)" = "x86_64" ]; then
-  if [ ! -d $LIVE_ROOT/LiveOS ]; then mkdir -p $LIVE_ROOT/LiveOS ; fi
-  cp /usr/bin/livecd-iso-to-disk $LIVE_ROOT/LiveOS
-fi
-%end
-
 %post
 
 cat >> /etc/rc.d/init.d/livesys << EOF
@@ -311,6 +304,14 @@ cat >> /etc/rc.d/init.d/livesys << EOF
 cat >> /usr/share/glib-2.0/schemas/org.gnome.software.gschema.override << FOE
 [org.gnome.software]
 download-updates=false
+FOE
+
+# don't autostart gnome-software session service
+rm -f /etc/xdg/autostart/gnome-software-service.desktop
+
+# disable the gnome-software shell search provider
+cat >> /usr/share/gnome-shell/search-providers/org.gnome.Software-search-provider.ini << FOE
+DefaultDisabled=true
 FOE
 
 # don't run gnome-initial-setup
@@ -381,11 +382,10 @@ EOF
 gnome-terminal
 aajohan-comfortaa-fonts
 anaconda
+anaconda-live
 dracut-config-generic
 dracut-live
-fedora-productimg-workstation
 glibc-all-langpacks
-grub2-efi
 kernel
 # Make sure that DNF doesn't pull in debug kernel to satisfy kmod() requires
 kernel-modules
@@ -397,5 +397,18 @@ syslinux
 -@standard
 -gfs2-utils
 -reiserfs-utils
+
+# This package is needed to boot the iso on UEFI
+shim
+shim-ia32
+grub2
+grub2-efi
+grub2-efi-*-cdboot
+grub2-efi-ia32
+efibootmgr
+
+# no longer in @core since 2018-10, but needed for livesys script
+initscripts
+chkconfig
 
 %end

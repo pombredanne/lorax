@@ -8,10 +8,11 @@ class LoraxLintConfig(PocketLintConfig):
     def __init__(self):
         PocketLintConfig.__init__(self)
 
-        self.falsePositives = [ FalsePositive(r"No name 'version' in module 'pylorax'"),
-                                FalsePositive(r"Module 'pylorax' has no 'version' member"),
-                                FalsePositive(r"Instance of 'int' has no .* member"),
-                                FalsePositive(r"ImageMinimizer.remove_rpm.runCallback: Unused argument .*")
+        self.falsePositives = [ FalsePositive(r"Module 'pylorax' has no 'version' member"),
+                                FalsePositive(r"Catching too general exception Exception"),
+                                FalsePositive(r"Module 'composer' has no 'version' member"),
+                                # See https://bugzilla.redhat.com/show_bug.cgi?id=1739167
+                                FalsePositive(r"Module 'rpm' has no '.*' member"),
                               ]
 
     @property
@@ -22,6 +23,10 @@ class LoraxLintConfig(PocketLintConfig):
         # No markup used
         retval.remove("pocketlint.checkers.markup")
         return retval
+
+    @property
+    def ignoreNames(self):
+        return { "bots", "rpmbuild" }
 
 if __name__ == "__main__":
     conf = LoraxLintConfig()

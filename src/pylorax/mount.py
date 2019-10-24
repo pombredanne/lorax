@@ -21,9 +21,10 @@ import logging
 log = logging.getLogger("livemedia-creator")
 
 import os
+import pycdlib
+from pycdlib.pycdlibexception import PyCdlibException
 
 from pylorax.imgutils import mount, umount
-from pylorax.executils import execWithCapture
 
 class IsoMountpoint(object):
     """
@@ -57,8 +58,9 @@ class IsoMountpoint(object):
         else:
             self.mount_dir = self.initrd_path
 
-        self.kernel = self.mount_dir+"/isolinux/vmlinuz"
-        self.initrd = self.mount_dir+"/isolinux/initrd.img"
+        kernel_list = [("/isolinux/vmlinuz", "/isolinux/initrd.img"),
+                       ("/ppc/ppc64/vmlinuz", "/ppc/ppc64/initrd.img"),
+                       ("/images/pxeboot/vmlinuz", "/images/pxeboot/initrd.img")]
 
         if os.path.isdir(self.mount_dir+"/repodata"):
             self.repo = self.mount_dir
@@ -68,9 +70,15 @@ class IsoMountpoint(object):
                       os.path.exists(self.mount_dir+"/images/install.img")
 
         try:
-            for f in [self.kernel, self.initrd]:
-                if not os.path.isfile(f):
-                    raise Exception("Missing file on iso: {0}".format(f))
+            for kernel, initrd in kernel_list:
+                if (os.path.isfile(self.mount_dir+kernel) and
+                    os.path.isfile(self.mount_dir+initrd)):
+                    self.kernel = self.mount_dir+kernel
+                    self.initrd = self.mount_dir+initrd
+                    break
+            else:
+                raise Exception("Missing kernel and initrd file in iso, failed"
+                                " to search under: {0}".format(kernel_list))
         except:
             self.umount()
             raise
@@ -88,9 +96,9 @@ class IsoMountpoint(object):
 
         Sets self.label if one is found
         """
-        isoinfo_output = execWithCapture("isoinfo", ["-d", "-i", self.iso_path])
-        log.debug(isoinfo_output)
-        for line in isoinfo_output.splitlines():
-            if line.startswith("Volume id: "):
-                self.label = line[11:]
-                return
+        try:
+            iso = pycdlib.PyCdlib()
+            iso.open(self.iso_path)
+            self.label = iso.pvd.volume_identifier.decode("UTF-8").strip()
+        except PyCdlibException as e:
+            log.error("Problem reading label from %s: %s", self.iso_path, e)

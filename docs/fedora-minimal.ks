@@ -10,8 +10,6 @@ network  --bootproto=dhcp --device=link --activate
 
 # Root password
 rootpw --plaintext removethispw
-# System authorization information
-auth --useshadow --passalgo=sha512
 # System keyboard
 keyboard --xlayouts=us --vckeymap=us
 # System language
@@ -29,6 +27,7 @@ bootloader --location=mbr
 # Partition clearing information
 clearpart --all --initlabel
 # Disk partitioning information
+reqpart
 part / --fstype="ext4" --size=4000
 part swap --size=1000
 

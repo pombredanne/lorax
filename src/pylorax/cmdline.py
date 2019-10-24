@@ -22,17 +22,12 @@ import os
 import sys
 import argparse
 
-def lorax_parser():
+from pylorax import vernum
+
+version = "{0}-{1}".format(os.path.basename(sys.argv[0]), vernum)
+
+def lorax_parser(dracut_default=""):
     """ Return the ArgumentParser for lorax"""
-
-    # get lorax version
-    try:
-        from pylorax import version
-        vernum = version.num
-    except ImportError:
-        vernum = "devel"
-
-    version = "{0}-{1}".format(os.path.basename(sys.argv[0]), vernum)
 
     parser = argparse.ArgumentParser(description="Create the Anaconda boot.iso")
 
@@ -51,7 +46,7 @@ def lorax_parser():
     optional.add_argument("-m", "--mirrorlist",
                         help="mirrorlist repository (may be listed multiple times)",
                         metavar="REPOSITORY", action="append", default=[])
-    optional.add_argument("-t", "--variant",
+    optional.add_argument("-t", "--variant", default="",
                         help="variant name", metavar="VARIANT")
     optional.add_argument("-b", "--bugurl",
                         help="bug reporting URL for the product", metavar="URL",
@@ -65,6 +60,9 @@ def lorax_parser():
     optional.add_argument("-i", "--installpkgs", default=[],
                         action="append", metavar="PACKAGE",
                         help="package glob to install before runtime-install.tmpl runs. (may be listed multiple times)")
+    optional.add_argument("-e", "--excludepkgs", default=[],
+                        action="append", metavar="PACKAGE",
+                        help="package glob to remove before runtime-install.tmpl runs. (may be listed multiple times)")
     optional.add_argument("--buildarch", default=None,
                         help="build architecture", metavar="ARCH")
     optional.add_argument("--volid", default=None,
@@ -77,12 +75,12 @@ def lorax_parser():
                         action="store_false", default=True, dest="doupgrade")
     optional.add_argument("--logfile", default="./lorax.log", type=os.path.abspath,
                         help="Path to logfile")
-    optional.add_argument("--tmp", default="/var/tmp",
+    optional.add_argument("--tmp", default="/var/tmp/lorax",
                         help="Top level temporary directory" )
     optional.add_argument("--cachedir", default=None, type=os.path.abspath,
                         help="DNF cache directory. Default is a temporary dir.")
     optional.add_argument("--workdir", default=None, type=os.path.abspath,
-                        help="Work directory, overrides --tmp. Default is a temporary dir under /var/tmp")
+                        help="Work directory, overrides --tmp. Default is a temporary dir under /var/tmp/lorax")
     optional.add_argument("--force", default=False, action="store_true",
                         help="Run even when the destination directory exists")
     optional.add_argument("--add-template", dest="add_templates",
@@ -105,6 +103,22 @@ def lorax_parser():
                           metavar="[repo]", help="Names of repos to enable")
     optional.add_argument("--disablerepo", action="append", default=[], dest="disablerepos",
                           metavar="[repo]", help="Names of repos to disable")
+    optional.add_argument("--rootfs-size", type=int, default=2,
+                          help="Size of root filesystem in GiB. Defaults to 2.")
+    optional.add_argument("--noverifyssl", action="store_true", default=False,
+                          help="Do not verify SSL certificates")
+    optional.add_argument("--dnfplugin", action="append", default=[], dest="dnfplugins",
+                          help="Enable a DNF plugin by name/glob, or * to enable all of them.")
+    optional.add_argument("--squashfs-only", action="store_true", default=False,
+                          help="Use a plain squashfs filesystem for the runtime.")
+
+    # dracut arguments
+    dracut_group = parser.add_argument_group("dracut arguments")
+    dracut_group.add_argument("--dracut-arg", action="append", dest="dracut_args",
+                              help="Argument to pass to dracut when "
+                                   "rebuilding the initramfs. Pass this "
+                                   "once for each argument. NOTE: this "
+                                   "overrides the default. (default: %s)" % dracut_default)
 
     # add the show version option
     parser.add_argument("-V", help="show program's version number and exit",
@@ -134,6 +148,8 @@ def lmc_parser(dracut_default=""):
                         help="Build an ami image")
     action.add_argument("--make-tar", action="store_true",
                         help="Build a tar of the root filesystem")
+    action.add_argument("--make-tar-disk", action="store_true",
+                        help="Build a tar of a partitioned disk image")
     action.add_argument("--make-pxe-live", action="store_true",
                         help="Build a live pxe boot squashfs image")
     action.add_argument("--make-ostree-live", action="store_true",
@@ -189,6 +205,9 @@ def lmc_parser(dracut_default=""):
     parser.add_argument("--nomacboot", action="store_false",
                         dest="domacboot")
 
+    parser.add_argument("--extra-boot-args", default="", dest="extra_boot_args",
+                        help="Extra arguments to add to the bootloader kernel cmdline in the templates")
+
     image_group = parser.add_argument_group("disk/fs image arguments")
     image_group.add_argument("--disk-image", type=os.path.abspath,
                              help="Path to existing disk image to use for creating final image.")
@@ -198,8 +217,12 @@ def lmc_parser(dracut_default=""):
                              help="Path to existing filesystem image to use for creating final image.")
     image_group.add_argument("--image-name", default=None,
                              help="Name of output file to create. Used for tar, fs and disk image. Default is a random name.")
+    image_group.add_argument("--tar-disk-name", default=None,
+                             help="Name of the archive member for make-tar-disk.")
     image_group.add_argument("--fs-label", default="Anaconda",
                              help="Label to set on fsimage, default is 'Anaconda'")
+    image_group.add_argument("--image-size-align", type=int, default=0,
+                             help="Create a disk image with a size that is a multiple of this value in MiB.")
     image_group.add_argument("--image-type", default=None,
                              help="Create an image with qemu-img. See qemu-img --help for supported formats.")
     image_group.add_argument("--qemu-arg", action="append", dest="qemu_args", default=[],
@@ -223,7 +246,7 @@ def lmc_parser(dracut_default=""):
 
     # Group of arguments to pass to qemu
     virt_group = parser.add_argument_group("qemu arguments")
-    virt_group.add_argument("--ram", metavar="MEMORY", type=int, default=1024,
+    virt_group.add_argument("--ram", metavar="MEMORY", type=int, default=2048,
                             help="Memory to allocate for installer in megabytes.")
     virt_group.add_argument("--vcpus", type=int, default=None,
                             help="Passed to qemu -smp command")
@@ -235,12 +258,14 @@ def lmc_parser(dracut_default=""):
                                  "Defaults to qemu-system-<arch>")
     virt_group.add_argument("--kernel-args",
                             help="Additional argument to pass to the installation kernel")
-    virt_group.add_argument("--ovmf-path", default="/usr/share/OVMF/",
+    virt_group.add_argument("--ovmf-path", default="/usr/share/edk2/ovmf/",
                             help="Path to OVMF firmware")
     virt_group.add_argument("--virt-uefi", action="store_true", default=False,
                             help="Use OVMF firmware to boot the VM in UEFI mode")
     virt_group.add_argument("--no-kvm", action="store_true", default=False,
                             help="Skip using kvm with qemu even if it is available.")
+    virt_group.add_argument("--with-rng", default="/dev/random",
+                            help="RNG device for QEMU (none for no RNG)")
 
     # dracut arguments
     dracut_group = parser.add_argument_group("dracut arguments")
@@ -275,12 +300,16 @@ def lmc_parser(dracut_default=""):
                         help="Substituted for @TITLE@ in bootloader config files")
     parser.add_argument("--project", default="Linux",
                         help="substituted for @PROJECT@ in bootloader config files")
-    parser.add_argument("--releasever", default="25",
+    parser.add_argument("--releasever", default="32",
                         help="substituted for @VERSION@ in bootloader config files")
     parser.add_argument("--volid", default=None, help="volume id")
-    parser.add_argument("--squashfs_args",
-                        help="additional squashfs args")
+    parser.add_argument("--squashfs-only", action="store_true", default=False,
+                        help="Use a plain squashfs filesystem for the runtime.")
     parser.add_argument("--timeout", default=None, type=int,
                         help="Cancel installer after X minutes")
+
+    # add the show version option
+    parser.add_argument("-V", help="show program's version number and exit",
+                      action="version", version=version)
 
     return parser

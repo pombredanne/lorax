@@ -1,7 +1,7 @@
 #
 # ltmpl.py
 #
-# Copyright (C) 2009-2015  Red Hat, Inc.
+# Copyright (C) 2009-2018  Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -26,6 +26,7 @@ logger = logging.getLogger("pylorax.ltmpl")
 import os, re, glob, shlex, fnmatch
 from os.path import basename, isdir
 from subprocess import CalledProcessError
+import shutil
 
 from pylorax.sysutils import joinpaths, cpfile, mvfile, replace, remove
 from pylorax.dnfhelper import LoraxDownloadCallback, LoraxRpmCallback
@@ -66,10 +67,16 @@ class LoraxTemplate(object):
         # remove comments
         lines = [line for line in lines if not line.startswith("#")]
 
-        # split with shlex and perform brace expansion
-        lines = [split_and_expand(line) for line in lines]
-
-        return lines
+        # split with shlex and perform brace expansion. This can fail, so we unroll the loop
+        # for better error reporting.
+        expanded_lines = []
+        try:
+            for line in lines:
+                expanded_lines.append(split_and_expand(line))
+        except Exception as e:
+            logger.error('shlex error processing "%s": %s', line, str(e))
+            raise
+        return expanded_lines
 
 def split_and_expand(line):
     return [exp for word in shlex.split(line) for exp in brace_expand(word)]
@@ -102,8 +109,84 @@ def rexists(pathname, root=""):
         return True
     return False
 
+class TemplateRunner(object):
+    '''
+    This class parses and executes Lorax templates. Sample usage:
+
+      # install a bunch of packages
+      runner = LoraxTemplateRunner(inroot=rundir, outroot=rundir, dbo=dnf_obj)
+      runner.run("install-packages.ltmpl")
+
+    NOTES:
+
+    * Parsing procedure is roughly:
+      1. Mako template expansion (on the whole file)
+      2. For each line of the result,
+
+        a. Whitespace splitting (using shlex.split())
+        b. Brace expansion (using brace_expand())
+        c. If the first token is the name of a function, call that function
+           with the rest of the line as arguments
+
+    * Parsing and execution are *separate* passes - so you can't use the result
+      of a command in an %if statement (or any other control statements)!
+    '''
+    def __init__(self, fatalerrors=True, templatedir=None, defaults=None, builtins=None):
+        self.fatalerrors = fatalerrors
+        self.templatedir = templatedir or "/usr/share/lorax"
+        self.templatefile = None
+        self.builtins = builtins or {}
+        self.defaults = defaults or {}
+
+
+    def run(self, templatefile, **variables):
+        for k,v in list(self.defaults.items()) + list(self.builtins.items()):
+            variables.setdefault(k,v)
+        logger.debug("executing %s with variables=%s", templatefile, variables)
+        self.templatefile = templatefile
+        t = LoraxTemplate(directories=[self.templatedir])
+        commands = t.parse(templatefile, variables)
+        self._run(commands)
+
+
+    def _run(self, parsed_template):
+        logger.info("running %s", self.templatefile)
+        for (num, line) in enumerate(parsed_template,1):
+            logger.debug("template line %i: %s", num, " ".join(line))
+            skiperror = False
+            (cmd, args) = (line[0], line[1:])
+            # Following Makefile convention, if the command is prefixed with
+            # a dash ('-'), we'll ignore any errors on that line.
+            if cmd.startswith('-'):
+                cmd = cmd[1:]
+                skiperror = True
+            try:
+                # grab the method named in cmd and pass it the given arguments
+                f = getattr(self, cmd, None)
+                if cmd[0] == '_' or cmd == 'run' or not isinstance(f, collections.Callable):
+                    raise ValueError("unknown command %s" % cmd)
+                f(*args)
+            except Exception: # pylint: disable=broad-except
+                if skiperror:
+                    logger.debug("ignoring error")
+                    continue
+                logger.error("template command error in %s:", self.templatefile)
+                logger.error("  %s", " ".join(line))
+                # format the exception traceback
+                exclines = traceback.format_exception(*sys.exc_info())
+                # skip the bit about "ltmpl.py, in _run()" - we know that
+                exclines.pop(1)
+                # log the "ErrorType: this is what happened" line
+                logger.error("  %s", exclines[-1].strip())
+                # and log the entire traceback to the debug log
+                for _line in ''.join(exclines).splitlines():
+                    logger.debug("  %s", _line)
+                if self.fatalerrors:
+                    raise
+
+
 # TODO: operate inside an actual chroot for safety? Not that RPM bothers..
-class LoraxTemplateRunner(object):
+class LoraxTemplateRunner(TemplateRunner):
     '''
     This class parses and executes Lorax templates. Sample usage:
 
@@ -117,18 +200,7 @@ class LoraxTemplateRunner(object):
 
     NOTES:
 
-    * Parsing procedure is roughly:
-      1. Mako template expansion (on the whole file)
-      2. For each line of the result,
-        a. Whitespace splitting (using shlex.split())
-        b. Brace expansion (using brace_expand())
-        c. If the first token is the name of a function, call that function
-           with the rest of the line as arguments
-
-    * Parsing and execution are *separate* passes - so you can't use the result
-      of a command in an %if statement (or any other control statements)!
-
-    * Commands that run external programs (systemctl, gconfset) currently use
+    * Commands that run external programs (e.g. systemctl) currently use
       the *host*'s copy of that program, which may cause problems if there's a
       big enough difference between the host and the image you're modifying.
 
@@ -150,14 +222,11 @@ class LoraxTemplateRunner(object):
         self.inroot = inroot
         self.outroot = outroot
         self.dbo = dbo
-        self.fatalerrors = fatalerrors
-        self.templatedir = templatedir or "/usr/share/lorax"
-        self.templatefile = None
-        # some builtin methods
-        self.builtins = DataHolder(exists=lambda p: rexists(p, root=inroot),
-                                   glob=lambda g: list(rglob(g, root=inroot)))
-        self.defaults = defaults or {}
+        builtins = DataHolder(exists=lambda p: rexists(p, root=inroot),
+                              glob=lambda g: list(rglob(g, root=inroot)))
         self.results = DataHolder(treeinfo=dict()) # just treeinfo for now
+
+        super(LoraxTemplateRunner, self).__init__(fatalerrors, templatedir, defaults, builtins)
         # TODO: set up custom logger with a filter to add line info
 
     def _out(self, path):
@@ -208,52 +277,6 @@ class LoraxTemplateRunner(object):
             for pkg in debug_pkgs:
                 f.write("%s\n" % pkg)
 
-
-    def run(self, templatefile, **variables):
-        for k,v in list(self.defaults.items()) + list(self.builtins.items()):
-            variables.setdefault(k,v)
-        logger.debug("executing %s with variables=%s", templatefile, variables)
-        self.templatefile = templatefile
-        t = LoraxTemplate(directories=[self.templatedir])
-        commands = t.parse(templatefile, variables)
-        self._run(commands)
-
-
-    def _run(self, parsed_template):
-        logger.info("running %s", self.templatefile)
-        for (num, line) in enumerate(parsed_template,1):
-            logger.debug("template line %i: %s", num, " ".join(line))
-            skiperror = False
-            (cmd, args) = (line[0], line[1:])
-            # Following Makefile convention, if the command is prefixed with
-            # a dash ('-'), we'll ignore any errors on that line.
-            if cmd.startswith('-'):
-                cmd = cmd[1:]
-                skiperror = True
-            try:
-                # grab the method named in cmd and pass it the given arguments
-                f = getattr(self, cmd, None)
-                if cmd[0] == '_' or cmd == 'run' or not isinstance(f, collections.Callable):
-                    raise ValueError("unknown command %s" % cmd)
-                f(*args)
-            except Exception: # pylint: disable=broad-except
-                if skiperror:
-                    logger.debug("ignoring error")
-                    continue
-                logger.error("template command error in %s:", self.templatefile)
-                logger.error("  %s", " ".join(line))
-                # format the exception traceback
-                exclines = traceback.format_exception(*sys.exc_info())
-                # skip the bit about "ltmpl.py, in _run()" - we know that
-                exclines.pop(1)
-                # log the "ErrorType: this is what happened" line
-                logger.error("  " + exclines[-1].strip())
-                # and log the entire traceback to the debug log
-                for line in ''.join(exclines).splitlines():
-                    logger.debug("  " + line)
-                if self.fatalerrors:
-                    raise
-
     def install(self, srcglob, dest):
         '''
         install SRC DEST
@@ -264,12 +287,16 @@ class LoraxTemplateRunner(object):
           If DEST doesn't exist, SRC will be copied to a file with that name,
           assuming the rest of the path exists.
           This is pretty much like how the 'cp' command works.
+
           Examples:
             install usr/share/myconfig/grub.conf /boot
             install /usr/share/myconfig/grub.conf.in /boot/grub.conf
         '''
         for src in rglob(self._in(srcglob), fatal=True):
-            cpfile(src, self._out(dest))
+            try:
+                cpfile(src, self._out(dest))
+            except shutil.Error as e:
+                logger.error(e)
 
     def installimg(self, *args):
         '''
@@ -316,6 +343,7 @@ class LoraxTemplateRunner(object):
         '''
         mkdir DIR [DIR ...]
           Create the named DIR(s). Will create leading directories as needed.
+
           Example:
             mkdir /images
         '''
@@ -329,6 +357,7 @@ class LoraxTemplateRunner(object):
         replace PATTERN REPLACEMENT FILEGLOB [FILEGLOB ...]
           Find-and-replace the given PATTERN (Python-style regex) with the given
           REPLACEMENT string for each of the files listed.
+
           Example:
             replace @VERSION@ ${product.version} /boot/grub.conf /boot/isolinux.cfg
         '''
@@ -346,7 +375,9 @@ class LoraxTemplateRunner(object):
           Append STRING (followed by a newline character) to FILE.
           Python character escape sequences ('\\n', '\\t', etc.) will be
           converted to the appropriate characters.
+
           Examples:
+
             append /etc/depmod.d/dd.conf "search updates built-in"
             append /etc/resolv.conf ""
         '''
@@ -359,6 +390,7 @@ class LoraxTemplateRunner(object):
           Add an item to the treeinfo data store.
           The given SECTION will have a new item added where
           KEY = ARG ARG ...
+
           Example:
             treeinfo images-${kernel.arch} boot.iso images/boot.iso
         '''
@@ -424,7 +456,10 @@ class LoraxTemplateRunner(object):
           If DEST doesn't exist, SRC will be copied to a file with
           that name, if the path leading to it exists.
         '''
-        cpfile(self._out(src), self._out(dest))
+        try:
+            cpfile(self._out(src), self._out(dest))
+        except shutil.Error as e:
+            logger.error(e)
 
     def move(self, src, dest):
         '''
@@ -452,26 +487,11 @@ class LoraxTemplateRunner(object):
         for f in rglob(self._out(fileglob), fatal=True):
             os.chmod(f, int(mode,8))
 
-    # TODO: do we need a new command for gsettings?
-    def gconfset(self, path, keytype, value, outfile=None):
-        '''
-        gconfset PATH KEYTYPE VALUE [OUTFILE]
-          Set the given gconf PATH, with type KEYTYPE, to the given value.
-          OUTFILE defaults to /etc/gconf/gconf.xml.defaults if not given.
-          Example:
-            gconfset /apps/metacity/general/num_workspaces int 1
-        '''
-        if outfile is None:
-            outfile = self._out("etc/gconf/gconf.xml.defaults")
-        cmd = ["gconftool-2", "--direct",
-                    "--config-source=xml:readwrite:%s" % outfile,
-                    "--set", "--type", keytype, path, value]
-        runcmd(cmd)
-
     def log(self, msg):
         '''
         log MESSAGE
           Emit the given log message. Be sure to put it in quotes!
+
           Example:
             log "Reticulating splines, please wait..."
         '''
@@ -495,7 +515,7 @@ class LoraxTemplateRunner(object):
             (this should be replaced with a "find" function)
             runcmd find ${root} -name "*.pyo" -type f -delete
             %for f in find(root, name="*.pyo"):
-                remove ${f}
+            remove ${f}
             %endfor
         '''
         cmd = cmdlist
@@ -511,20 +531,26 @@ class LoraxTemplateRunner(object):
             logger.debug("command finished successfully")
         except CalledProcessError as e:
             if e.output:
-                logger.debug('command output:\n%s', e.output)
-            logger.debug('command returned failure (%d)', e.returncode)
+                logger.error('command output:\n%s', e.output)
+            logger.error('command returned failure (%d)', e.returncode)
             raise
 
     def installpkg(self, *pkgs):
         '''
-        installpkg [--required] [--except PKGGLOB [--except PKGGLOB ...]] PKGGLOB [PKGGLOB ...]
+        installpkg [--required|--optional] [--except PKGGLOB [--except PKGGLOB ...]] PKGGLOB [PKGGLOB ...]
           Request installation of all packages matching the given globs.
           Note that this is just a *request* - nothing is *actually* installed
           until the 'run_pkg_transaction' command is given.
+
+          --required is now the default. If the PKGGLOB can be missing pass --optional
         '''
-        required = False
-        if pkgs[0] == '--required':
+        if pkgs[0] == '--optional':
             pkgs = pkgs[1:]
+            required = False
+        elif pkgs[0] == '--required':
+            pkgs = pkgs[1:]
+            required = True
+        else:
             required = True
 
         excludes = []
@@ -536,6 +562,7 @@ class LoraxTemplateRunner(object):
             excludes.append(pkgs[idx+1])
             pkgs = pkgs[:idx] + pkgs[idx+2:]
 
+        errors = False
         for p in pkgs:
             try:
                 # Start by using Subject to generate a package query, which will
@@ -549,23 +576,41 @@ class LoraxTemplateRunner(object):
                 # dnf queries don't have a concept of negative globs which is why
                 # the filtering is done the hard way.
 
-                pkgnames = {pkg.name for pkg in dnf.subject.Subject(p).get_best_query(self.dbo.sack)}
+                pkgnames = [pkg for pkg in dnf.subject.Subject(p).get_best_query(self.dbo.sack).filter(latest=True)]
+                if not pkgnames:
+                    raise dnf.exceptions.PackageNotFoundError("no package matched", p)
 
+                # Apply excludes to the name only
                 for exclude in excludes:
-                    pkgnames = {pkgname for pkgname in pkgnames if not fnmatch.fnmatch(pkgname, exclude)}
+                    pkgnames = [pkg for pkg in pkgnames if not fnmatch.fnmatch(pkg.name, exclude)]
 
-                for pkgname in pkgnames:
-                    self.dbo.install(pkgname)
+                # Convert to a sorted NVR list for installation
+                pkgnvrs = sorted(["{}-{}-{}".format(pkg.name, pkg.version, pkg.release) for pkg in pkgnames])
+
+                # If the request is a glob, expand it in the log
+                if any(g for g in ['*','?','.'] if g in p):
+                    logger.info("installpkg: %s expands to %s", p, ",".join(pkgnvrs))
+
+                for pkgnvr in pkgnvrs:
+                    try:
+                        self.dbo.install(pkgnvr)
+                    except Exception as e: # pylint: disable=broad-except
+                        if required:
+                            raise
+                        # Not required, log it and continue processing pkgs
+                        logger.error("installpkg %s failed: %s", pkgnvr, str(e))
             except Exception as e: # pylint: disable=broad-except
-                # FIXME: save exception and re-raise after the loop finishes
                 logger.error("installpkg %s failed: %s", p, str(e))
-                if required:
-                    raise
+                errors = True
+
+        if errors and required:
+            raise Exception("Required installpkg failed.")
 
     def removepkg(self, *pkgs):
         '''
         removepkg PKGGLOB [PKGGLOB...]
           Delete the named package(s).
+
           IMPLEMENTATION NOTES:
             RPM scriptlets (%preun/%postun) are *not* run.
             Files are deleted, but directories are left behind.
@@ -630,6 +675,7 @@ class LoraxTemplateRunner(object):
           (or packages) named.
           If '--allbut' is used, all the files from the given package(s) will
           be removed *except* the ones which match the file globs.
+
           Examples:
             removefrom usbutils /usr/bin/*
             removefrom xfsprogs --allbut /sbin/*
@@ -663,6 +709,7 @@ class LoraxTemplateRunner(object):
         else:
             logger.debug("removefrom %s: no files to remove!", cmd)
 
+    # pylint: disable=anomalous-backslash-in-string
     def removekmod(self, *globs):
         '''
         removekmod GLOB [GLOB...] [--allbut] KEEPGLOB [KEEPGLOB...]
@@ -674,7 +721,7 @@ class LoraxTemplateRunner(object):
           to search and one KEEPGLOB to keep. The KEEPGLOB is expanded to be *KEEPGLOB*
           so that it will match anywhere in the path.
 
-          This only removes files from under /lib/modules/*/kernel/
+          This only removes files from under /lib/modules/\*/kernel/
 
           Examples:
             removekmod sound drivers/media drivers/hwmon drivers/video
@@ -723,6 +770,7 @@ class LoraxTemplateRunner(object):
         '''
         createaddrsize INITRD_ADDRESS INITRD ADDRSIZE
           Create the initrd.addrsize file required in LPAR boot process.
+
           Examples:
             createaddrsize ${INITRD_ADDRESS} ${outroot}/${BOOTDIR}/initrd.img ${outroot}/${BOOTDIR}/initrd.addrsize
         '''
@@ -735,6 +783,7 @@ class LoraxTemplateRunner(object):
         '''
         systemctl [enable|disable|mask] UNIT [UNIT...]
           Enable, disable, or mask the given systemd units.
+
           Examples:
             systemctl disable lvm2-monitor.service
             systemctl mask fedora-storage-init.service fedora-configure.service
@@ -745,11 +794,95 @@ class LoraxTemplateRunner(object):
             logger.debug("systemctl: no units given for %s, ignoring", cmd)
             return
         self.mkdir("/run/systemd/system") # XXX workaround for systemctl bug
-        systemctl = ('systemctl', '--root', self.outroot, '--no-reload',
-                     '--quiet', cmd)
+        systemctl = ['systemctl', '--root', self.outroot, '--no-reload', cmd]
+        # When a unit doesn't exist systemd aborts the command. Run them one at a time.
         # XXX for some reason 'systemctl enable/disable' always returns 1
-        try:
-            cmd = systemctl + units
-            runcmd(cmd)
-        except CalledProcessError:
-            pass
+        for unit in units:
+            try:
+                cmd = systemctl + [unit]
+                runcmd(cmd)
+            except CalledProcessError:
+                pass
+
+class LiveTemplateRunner(TemplateRunner):
+    """
+    This class parses and executes a limited Lorax template. Sample usage:
+
+      # install a bunch of packages
+      runner = LiveTemplateRunner(dbo, templatedir, defaults)
+      runner.run("live-install.tmpl")
+
+      It is meant to be used with the live-install.tmpl which lists the per-arch
+      pacages needed to build the live-iso output.
+    """
+    def __init__(self, dbo, fatalerrors=True, templatedir=None, defaults=None):
+        self.dbo = dbo
+        self.pkgs = []
+        self.pkgnames = []
+
+        super(LiveTemplateRunner, self).__init__(fatalerrors, templatedir, defaults)
+
+    def installpkg(self, *pkgs):
+        '''
+        installpkg [--required|--optional] [--except PKGGLOB [--except PKGGLOB ...]] PKGGLOB [PKGGLOB ...]
+          Request installation of all packages matching the given globs.
+          Note that this is just a *request* - nothing is *actually* installed
+          until the 'run_pkg_transaction' command is given.
+
+          --required is now the default. If the PKGGLOB can be missing pass --optional
+        '''
+        if pkgs[0] == '--optional':
+            pkgs = pkgs[1:]
+            required = False
+        elif pkgs[0] == '--required':
+            pkgs = pkgs[1:]
+            required = True
+        else:
+            required = True
+
+        excludes = []
+        while '--except' in pkgs:
+            idx = pkgs.index('--except')
+            if len(pkgs) == idx+1:
+                raise ValueError("installpkg needs an argument after --except")
+
+            excludes.append(pkgs[idx+1])
+            pkgs = pkgs[:idx] + pkgs[idx+2:]
+
+        errors = False
+        for p in pkgs:
+            try:
+                # Start by using Subject to generate a package query, which will
+                # give us a query object similar to what dbo.install would select,
+                # minus the handling for multilib. This query may contain
+                # multiple arches. Pull the package names out of that, filter any
+                # that match the excludes patterns, and pass those names back to
+                # dbo.install to do the actual, arch and version and multilib
+                # aware, package selction.
+
+                # dnf queries don't have a concept of negative globs which is why
+                # the filtering is done the hard way.
+
+                pkgnames = [pkg for pkg in dnf.subject.Subject(p).get_best_query(self.dbo.sack).filter(latest=True)]
+                if not pkgnames:
+                    raise dnf.exceptions.PackageNotFoundError("no package matched", p)
+
+                # Apply excludes to the name only
+                for exclude in excludes:
+                    pkgnames = [pkg for pkg in pkgnames if not fnmatch.fnmatch(pkg.name, exclude)]
+
+                # Convert to a sorted NVR list for installation
+                pkgnvrs = sorted(["{}-{}-{}".format(pkg.name, pkg.version, pkg.release) for pkg in pkgnames])
+
+                # If the request is a glob, expand it in the log
+                if any(g for g in ['*','?','.'] if g in p):
+                    logger.info("installpkg: %s expands to %s", p, ",".join(pkgnvrs))
+
+                self.pkgs.extend(pkgnvrs)
+                self.pkgnames.extend([pkg.name for pkg in pkgnames])
+            except Exception as e: # pylint: disable=broad-except
+                logger.error("installpkg %s failed: %s", p, str(e))
+                errors = True
+
+        if errors and required:
+            raise Exception("Required installpkg failed.")

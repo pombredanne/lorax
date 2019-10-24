@@ -27,6 +27,7 @@ import logging
 log = logging.getLogger("pylorax")
 program_log = logging.getLogger("program")
 
+# pylint: disable=not-context-manager
 from threading import Lock
 program_log_lock = Lock()
 
@@ -115,6 +116,7 @@ def startProgram(argv, root='/', stdin=None, stdout=subprocess.PIPE, stderr=subp
     if env_add:
         env.update(env_add)
 
+    # pylint: disable=subprocess-popen-preexec-fn
     return subprocess.Popen(argv,
                             stdin=stdin,
                             stdout=stdout,

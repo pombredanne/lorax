@@ -1,6 +1,6 @@
 # imgutils.py - utility functions/classes for building disk images
 #
-# Copyright (C) 2011-2015 Red Hat, Inc.
+# Copyright (C) 2011-2018 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,6 +24,7 @@ import os, tempfile
 from os.path import join, dirname
 from subprocess import Popen, PIPE, CalledProcessError
 import sys
+import time
 import traceback
 import multiprocessing
 from time import sleep
@@ -35,8 +36,8 @@ from pylorax.executils import runcmd, runcmd_output
 
 ######## Functions for making container images (cpio, tar, squashfs) ##########
 
-def compress(command, rootdir, outfile, compression="xz", compressargs=None):
-    '''Make a compressed archive of the given rootdir.
+def compress(command, root, outfile, compression="xz", compressargs=None):
+    '''Make a compressed archive of the given rootdir or file.
     command is a list of the archiver commands to run
     compression should be "xz", "gzip", "lzma", "bzip2", or None.
     compressargs will be used on the compression commandline.'''
@@ -59,12 +60,23 @@ def compress(command, rootdir, outfile, compression="xz", compressargs=None):
         compression = "pbzip2"
         compressargs.insert(0, "-p%d" % multiprocessing.cpu_count())
 
-    logger.debug("find %s -print0 |%s | %s %s > %s", rootdir, " ".join(command),
-                 compression, " ".join(compressargs), outfile)
     find, archive, comp = None, None, None
+
     try:
-        find = Popen(["find", ".", "-print0"], stdout=PIPE, cwd=rootdir)
-        archive = Popen(command, stdin=find.stdout, stdout=PIPE, cwd=rootdir)
+        if os.path.isdir(root):
+            logger.debug("find %s -print0 |%s | %s %s > %s", root, " ".join(command),
+                    compression, " ".join(compressargs), outfile)
+
+            find = Popen(["find", ".", "-print0"], stdout=PIPE, cwd=root)
+            archive = Popen(command, stdin=find.stdout, stdout=PIPE, cwd=root)
+        else:
+            logger.debug("echo %s |%s | %s %s > %s", root, " ".join(command),
+                         compression, " ".join(compressargs), outfile)
+
+            archive = Popen(command, stdin=PIPE, stdout=PIPE, cwd=os.path.dirname(root))
+            archive.stdin.write(os.path.basename(root).encode("utf-8") + b"\0")
+            archive.stdin.close()
+
         comp = Popen([compression] + compressargs,
                      stdin=archive.stdout, stdout=open(outfile, "wb"))
         comp.wait()
@@ -75,18 +87,18 @@ def compress(command, rootdir, outfile, compression="xz", compressargs=None):
         list(p.kill() for p in (find, archive, comp) if p)
         return 1
 
-def mkcpio(rootdir, outfile, compression="xz", compressargs=None):
+def mkcpio(root, outfile, compression="xz", compressargs=None):
     compressargs = compressargs or ["-9"]
     return compress(["cpio", "--null", "--quiet", "-H", "newc", "-o"],
-                    rootdir, outfile, compression, compressargs)
+                    root, outfile, compression, compressargs)
 
-def mktar(rootdir, outfile, compression="xz", compressargs=None, selinux=True):
+def mktar(root, outfile, compression="xz", compressargs=None, selinux=True):
     compressargs = compressargs or ["-9"]
     tar_cmd = ["tar", "--no-recursion"]
     if selinux:
         tar_cmd += ["--selinux", "--acls", "--xattrs"]
     tar_cmd += ["-cf-", "--null", "-T-"]
-    return compress(tar_cmd, rootdir, outfile, compression, compressargs)
+    return compress(tar_cmd, root, outfile, compression, compressargs)
 
 def mksquashfs(rootdir, outfile, compression="default", compressargs=None):
     '''Make a squashfs image containing the given rootdir.'''
@@ -111,13 +123,7 @@ def mkrootfsimg(rootdir, outfile, label, size=2, sysroot=""):
         fssize = None       # Let mkext4img figure out the needed size
 
     mkext4img(rootdir, outfile, label=label, size=fssize)
-    # Reset selinux context on new rootfs
-    with LoopDev(outfile) as loopdev:
-        with Mount(loopdev) as mnt:
-            cmd = [ "setfiles", "-e", "/proc", "-e", "/sys", "-e", "/dev", "-e", "/install",
-                    "/etc/selinux/targeted/contexts/files/file_contexts", "/"]
-            root = join(mnt, sysroot.lstrip("/"))
-            runcmd(cmd, root=root)
+
 
 ######## Utility functions ###############################################
 
@@ -147,11 +153,55 @@ def mkqemu_img(outfile, size, options=None):
         options.extend(["-f", "qcow2"])
     runcmd(["qemu-img", "create"] + options + [outfile, str(size)])
 
+def loop_waitfor(loop_dev, outfile):
+    """Make sure the loop device is attached to the outfile.
+
+    It seems that on rare occasions losetup can return before the /dev/loopX is
+    ready for use, causing problems with mkfs. This tries to make sure that the
+    loop device really is associated with the backing file before continuing.
+
+    Raise RuntimeError if it isn't setup after 5 tries.
+    """
+    for _x in range(0,5):
+        runcmd(["udevadm", "settle", "--timeout", "300"])
+        ## XXX Note that losetup --list output can be truncated to 64 bytes in some
+        ##     situations. Don't use it to lookup backing file, go the other way
+        ##     and lookup the loop for the backing file. See util-linux lib/loopdev.c
+        ##     loopcxt_get_backing_file()
+        if get_loop_name(outfile) == os.path.basename(loop_dev):
+            return
+
+        # If this really is a race, give it some time to settle down
+        time.sleep(1)
+
+    raise RuntimeError("Unable to setup %s on %s" % (loop_dev, outfile))
+
 def loop_attach(outfile):
-    '''Attach a loop device to the given file. Return the loop device name.
-    Raises CalledProcessError if losetup fails.'''
-    dev = runcmd_output(["losetup", "--find", "--show", outfile])
-    return dev.strip()
+    """Attach a loop device to the given file. Return the loop device name.
+
+    On rare occasions it appears that the device never shows up, some experiments
+    seem to indicate that it may be a race with another process using /dev/loop* devices.
+
+    So we now try 3 times before actually failing.
+
+    Raises CalledProcessError if losetup fails.
+    """
+    retries = 0
+    while True:
+        try:
+            retries += 1
+            dev = runcmd_output(["losetup", "--find", "--show", outfile]).strip()
+
+            # Sometimes the loop device isn't ready yet, make extra sure before returning
+            loop_waitfor(dev, outfile)
+        except RuntimeError:
+            # Try to setup the loop device 3 times
+            if retries == 3:
+                logger.error("loop_attach failed, retries exhausted.")
+                raise
+            logger.debug("Try %d failed, %s did not appear.", retries, dev)
+        break
+    return dev
 
 def loop_detach(loopdev):
     '''Detach the given loop device. Return False on failure.'''
@@ -198,7 +248,7 @@ def mount(dev, opts="", mnt=None):
     runcmd(cmd)
     return mnt
 
-def umount(mnt,  lazy=False, maxretry=3, retrysleep=1.0):
+def umount(mnt,  lazy=False, maxretry=3, retrysleep=1.0, delete=True):
     '''Unmount the given mountpoint. If lazy is True, do a lazy umount (-l).
     If the mount was a temporary dir created by mount, it will be deleted.
     raises CalledProcessError if umount fails.'''
@@ -221,7 +271,7 @@ def umount(mnt,  lazy=False, maxretry=3, retrysleep=1.0):
             sleep(retrysleep)
         else:
             break
-    if 'lorax.imgutils' in mnt:
+    if delete and 'lorax.imgutils' in mnt:
         os.rmdir(mnt)
         logger.debug("remove tmp mountdir %s", mnt)
     return (rv == 0)
@@ -232,7 +282,7 @@ def copytree(src, dest, preserve=True):
     If preserve is False, uses cp -R (useful for modeless filesystems)
     raises CalledProcessError if copy fails.'''
     logger.debug("copytree %s %s", src, dest)
-    cp = ["cp", "-a"] if preserve else ["cp", "-R", "-L"]
+    cp = ["cp", "-a"] if preserve else ["cp", "-R", "-L", "--preserve=timestamps"]
     cp += [join(src, "."), os.path.abspath(dest)]
     runcmd(cp)
 
@@ -317,6 +367,31 @@ class Mount(object):
     def __exit__(self, exc_type, exc_value, tracebk):
         umount(self.mnt)
 
+def kpartx_disk_img(disk_img):
+    """Attach a disk image's partitions to /dev/loopX using kpartx
+
+    :param disk_img: The full path to a partitioned disk image
+    :type disk_img: str
+    :returns: list of (loopXpN, size)
+    :rtype: list of tuples
+    """
+    # Example kpartx output
+    # kpartx -p p -v -a /tmp/diskV2DiCW.im
+    # add map loop2p1 (253:2): 0 3481600 linear /dev/loop2 2048
+    # add map loop2p2 (253:3): 0 614400 linear /dev/loop2 3483648
+    kpartx_output = runcmd_output(["kpartx", "-v", "-a", "-s", disk_img])
+    logger.debug(kpartx_output)
+
+    # list of (deviceName, sizeInBytes)
+    loop_devices = []
+    for line in kpartx_output.splitlines():
+        # add map loop2p3 (253:4): 0 7139328 linear /dev/loop2 528384
+        # 3rd element is size in 512 byte blocks
+        if line.startswith("add map "):
+            fields = line[8:].split()
+            loop_devices.append( (fields[0], int(fields[3])*512) )
+    return loop_devices
+
 class PartitionMount(object):
     """ Mount a partitioned image file using kpartx """
     def __init__(self, disk_img, mount_ok=None, submount=None):
@@ -348,21 +423,8 @@ class PartitionMount(object):
         if not self.mount_ok:
             self.mount_ok = lambda mount_dir: os.path.isfile(mount_dir+"/etc/passwd")
 
-        # Example kpartx output
-        # kpartx -p p -v -a /tmp/diskV2DiCW.im
-        # add map loop2p1 (253:2): 0 3481600 linear /dev/loop2 2048
-        # add map loop2p2 (253:3): 0 614400 linear /dev/loop2 3483648
-        kpartx_output = runcmd_output(["kpartx", "-v", "-a", "-s", self.disk_img])
-        logger.debug(kpartx_output)
-
         # list of (deviceName, sizeInBytes)
-        self.loop_devices = []
-        for line in kpartx_output.splitlines():
-            # add map loop2p3 (253:4): 0 7139328 linear /dev/loop2 528384
-            # 3rd element is size in 512 byte blocks
-            if line.startswith("add map "):
-                fields = line[8:].split()
-                self.loop_devices.append( (fields[0], int(fields[3])*512) )
+        self.loop_devices = kpartx_disk_img(self.disk_img)
 
     def __enter__(self):
         # Mount the device selected by mount_ok, if possible
@@ -406,7 +468,7 @@ def mkfsimage(fstype, rootdir, outfile, size=None, mkfsargs=None, mountargs="", 
     '''Generic filesystem image creation function.
     fstype should be a filesystem type - "mkfs.${fstype}" must exist.
     graft should be a dict: {"some/path/in/image": "local/file/or/dir"};
-      if the path ends with a '/' it's assumed to be a directory.
+    if the path ends with a '/' it's assumed to be a directory.
     Will raise CalledProcessError if something goes wrong.'''
     mkfsargs = mkfsargs or []
     graft = graft or {}
@@ -426,14 +488,21 @@ def mkfsimage(fstype, rootdir, outfile, size=None, mkfsargs=None, mountargs="", 
                 copytree(rootdir, mnt, preserve)
             do_grafts(graft, mnt, preserve)
 
+            # Save information about filesystem usage
+            execWithRedirect("df", [mnt])
+
     # Make absolutely sure that the data has been written
     runcmd(["sync"])
 
 # convenience functions with useful defaults
 def mkdosimg(rootdir, outfile, size=None, label="", mountargs="shortname=winnt,umask=0077", graft=None):
     graft = graft or {}
+    mkfsargs = ["-n", label]
+    if 'SOURCE_DATE_EPOCH' in os.environ:
+        mkfsargs.extend(["-i",
+                "{:x}".format(int(os.environ['SOURCE_DATE_EPOCH']))])
     mkfsimage("msdos", rootdir, outfile, size, mountargs=mountargs,
-              mkfsargs=["-n", label], graft=graft)
+              mkfsargs=mkfsargs, graft=graft)
 
 def mkext4img(rootdir, outfile, size=None, label="", mountargs="", graft=None):
     graft = graft or {}
@@ -449,3 +518,37 @@ def mkhfsimg(rootdir, outfile, size=None, label="", mountargs="", graft=None):
     graft = graft or {}
     mkfsimage("hfsplus", rootdir, outfile, size, mountargs=mountargs,
               mkfsargs=["-v", label], graft=graft)
+
+def mkfsimage_from_disk(diskimage, fsimage, img_size=None, label="Anaconda"):
+    """
+    Copy the / partition of a partitioned disk image to an un-partitioned
+    disk image.
+
+    :param str diskimage: The full path to partitioned disk image with a /
+    :param str fsimage: The full path of the output fs image file
+    :param int img_size: Optional size of the fsimage in MiB or None to make
+       it as small as possible
+    :param str label: The label to apply to the image. Defaults to "Anaconda"
+    """
+    with PartitionMount(diskimage) as img_mount:
+        if not img_mount or not img_mount.mount_dir:
+            return None
+
+        logger.info("Creating fsimage %s (%s)", fsimage, img_size or "minimized")
+        if img_size:
+            # convert to Bytes
+            img_size *= 1024**2
+
+        mkext4img(img_mount.mount_dir, fsimage, size=img_size, label=label)
+
+def default_image_name(compression, basename):
+    """ Return a default image name with the correct suffix for the compression type.
+
+    :param str compression: Compression type
+    :param str basename: Base filename
+    :returns: basename with compression suffix
+
+    If the compression is unknown it defaults to xz
+    """
+    SUFFIXES = {"xz": ".xz", "gzip": ".gz", "bzip2": ".bz2", "lzma": ".lzma"}
+    return basename + SUFFIXES.get(compression, ".xz")

@@ -51,20 +51,37 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'Lorax'
-copyright = u'2015, Red Hat, Inc.'      # pylint: disable=redefined-builtin
+copyright = u'2018, Red Hat, Inc.'      # pylint: disable=redefined-builtin
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
 # built documents.
+# Pass in LORAX_VERSION to set a specific version
+# Set LORAX_VERSION=next to bump it to the next release
 def read_version():
-    """ Read version from ../lorax.spec"""
+    """Read version from $LORAX_VERSION or ../lorax.spec, or bump the version from lorax.spec"""
+    # This allows the .spec version to be overridded. eg. when documenting an upcoming release
+    if "LORAX_VERSION" in os.environ and "next" not in os.environ["LORAX_VERSION"]:
+        return os.environ["LORAX_VERSION"]
+
+    doc_version = None
     import re
     version_re = re.compile(r"Version:\s+(.*)")
     with open("../lorax.spec", "rt") as f:
         for line in f:
             m = version_re.match(line)
             if m:
-                return m.group(1)
+                doc_version = m.group(1)
+    if not doc_version:
+        raise RuntimeError("Failed to find current version")
+
+    # Make it easier to generate docs for the next release
+    if "next" in os.environ["LORAX_VERSION"]:
+        fields = doc_version.split(".")
+        fields[-1] = str(int(fields[-1]) + 1)
+        doc_version = ".".join(fields)
+
+    return doc_version
 
 #
 # The short X.Y version.
@@ -155,6 +172,9 @@ html_static_path = ['_static']
 # using the given strftime format.
 #html_last_updated_fmt = '%b %d, %Y'
 
+# Turn off smartquotes, it mangles dashes in the docstrings
+smartquotes = False
+
 # If true, SmartyPants will be used to convert quotes and dashes to
 # typographically correct entities.
 #html_use_smartypants = True
@@ -214,7 +234,7 @@ latex_elements = {
 #  author, documentclass [howto, manual, or own class]).
 latex_documents = [
   ('index', 'Lorax.tex', u'Lorax Documentation',
-   u'Anaconda Team', 'manual'),
+   u'Weldr Team', 'manual'),
 ]
 
 # The name of an image file (relative to this directory) to place at the top of
@@ -243,8 +263,10 @@ latex_documents = [
 # One entry per manual page. List of tuples
 # (source start file, name, description, authors, manual section).
 man_pages = [
-    ('lorax', 'lorax', u'Lorax Documentation', [u'Anaconda Team'], 1),
-    ('livemedia-creator', 'livemedia-creator', u'Live Media Creator Documentation', [u'Anaconda Team'], 1)
+    ('lorax', 'lorax', u'Lorax Documentation', [u'Weldr Team'], 1),
+    ('livemedia-creator', 'livemedia-creator', u'Live Media Creator Documentation', [u'Weldr Team'], 1),
+    ('lorax-composer', 'lorax-composer', u'Lorax Composer Documentation', [u'Weldr Team'], 1),
+    ('composer-cli', 'composer-cli', u'Composer Cmdline Utility Documentation', [u'Weldr Team'], 1),
 ]
 
 # If true, show URL addresses after external links.
@@ -258,7 +280,7 @@ man_pages = [
 #  dir menu entry, description, category)
 texinfo_documents = [
   ('index', 'Lorax', u'Lorax Documentation',
-   u'Anaconda Team', 'Lorax', 'One line description of project.',
+   u'Weldr Team', 'Lorax', 'One line description of project.',
    'Miscellaneous'),
 ]
 
@@ -279,9 +301,9 @@ texinfo_documents = [
 
 # Bibliographic Dublin Core info.
 epub_title = u'Lorax'
-epub_author = u'Anaconda Team'
-epub_publisher = u'Anaconda Team'
-epub_copyright = u'2015, Red Hat, Inc.'
+epub_author = u'Weldr Team'
+epub_publisher = u'Weldr Team'
+epub_copyright = u'2018, Red Hat, Inc.'
 
 # The basename for the epub file. It defaults to the project name.
 #epub_basename = u'src'
@@ -388,6 +410,6 @@ class Mock(object):
     def __getitem__(cls, key):
         return cls.__getattr__(key)
 
-MOCK_MODULES = ["selinux", "dnf", "rpmUtils", "rpmUtils.arch"]
+MOCK_MODULES = ["selinux", "dnf", "dnf.logging", "dnf.transaction", "rpmUtils", "rpmUtils.arch"]
 for mod_name in MOCK_MODULES:
     sys.modules[mod_name] = Mock()

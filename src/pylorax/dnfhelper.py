@@ -23,6 +23,7 @@
 import logging
 logger = logging.getLogger("pylorax.dnfhelper")
 import dnf
+import dnf.transaction
 import collections
 import time
 import pylorax.output as output
@@ -66,21 +67,23 @@ class LoraxDownloadCallback(dnf.callback.DownloadProgress):
         }
         self.output.write(msg % vals)
 
-    def end(self, payload, status, err_msg):
+    def end(self, payload, status, msg):
         nevra = str(payload)
         if status is dnf.callback.STATUS_OK:
             self.downloads[nevra] = payload.download_size
             self.pkgno += 1
             self._update()
             return
-        logger.critical("Failed to download '%s': %d - %s", nevra, status, err_msg)
+        logger.critical("Failed to download '%s': %d - %s", nevra, status, msg)
 
     def progress(self, payload, done):
         nevra = str(payload)
         self.downloads[nevra] = done
         self._update()
 
-    def start(self, total_files, total_size):
+    # dnf 2.5.0 adds a new argument, accept it if it is passed
+    # pylint: disable=arguments-differ
+    def start(self, total_files, total_size, total_drpms=0):
         self.total_files = total_files
         self.total_size = total_size
 
@@ -91,17 +94,17 @@ class LoraxRpmCallback(dnf.callback.TransactionProgress):
         self._last_ts = None
 
     def progress(self, package, action, ti_done, ti_total, ts_done, ts_total):
-        if action == self.PKG_INSTALL:
+        if action == dnf.transaction.PKG_INSTALL:
             # do not report same package twice
             if self._last_ts == ts_done:
                 return
             self._last_ts = ts_done
 
-            msg = '(%d/%d) %s.%s' % (ts_done, ts_total, package.name, package.arch)
+            msg = '(%d/%d) %s' % (ts_done, ts_total, package)
             logger.info(msg)
-        elif action == self.TRANS_POST:
+        elif action == dnf.transaction.TRANS_POST:
             msg = "Performing post-installation setup tasks"
             logger.info(msg)
 
-    def error(self, err_msg):
-        logger.warning(err_msg)
+    def error(self, message):
+        logger.warning(message)

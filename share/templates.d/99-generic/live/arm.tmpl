@@ -6,6 +6,8 @@ BOOTDIR="boot"
 KERNELDIR=PXEBOOTDIR
 LIVEDIR="LiveOS"
 LORAXDIR="usr/share/lorax/"
+
+from os.path import basename
 %>
 
 mkdir ${LIVEDIR}
@@ -37,7 +39,13 @@ mkdir ${KERNELDIR}
 %for img in images:
     %if exists("%s/%s/" % (LORAXDIR, img)):
         installimg --xz -9 --memlimit-compress=3700MiB ${LORAXDIR}/${img}/ images/${img}.img
+        treeinfo images-${basearch} ${img}.img images/${img}.img
     %endif
+%endfor
+
+# Add the license files
+%for f in glob("/usr/share/licenses/*-release/*"):
+    install ${f} ${f|basename}
 %endfor
 
 ## FIXME: ARM may need some extra boot config

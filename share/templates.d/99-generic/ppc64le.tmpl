@@ -6,24 +6,21 @@ GRUBDIR="boot/grub"
 STAGE2IMG="images/install.img"
 LORAXDIR="usr/share/lorax/"
 
-## NOTE: yaboot freaks out and stops parsing its config if it sees a '\',
-## so we can't use the udev escape sequences in the root arg.
-## Instead we'll just replace any non-ASCII characters in the isolabel
-## with '_', which means we won't need any udev escapes.
-isolabel = ''.join(ch if ch.isalnum() else '_' for ch in isolabel)
+## Don't allow spaces or escape characters in the iso label
+def valid_label(ch):
+    return ch.isalnum() or ch == '_'
 
-## Anaconda finds the CDROM device automatically
-rootarg = ""
-%>
+isolabel = ''.join(ch if valid_label(ch) else '-' for ch in isolabel)
 
-## Test ${runtime_img} to see if udf is needed
-<%
-    import os
-    from pylorax.sysutils import joinpaths
-    if os.stat(joinpaths(inroot, runtime_img)).st_size >= 4*1024**3:
-        udfargs = "-allow-limited-size"
-    else:
-        udfargs = ""
+import os
+from os.path import basename
+from pylorax.sysutils import joinpaths
+
+# Test the runtime_img, if it is > 4GiB we need to set -iso-level to 3
+if os.stat(joinpaths(inroot, runtime_img)).st_size >= 4*1024**3:
+    isoargs = "-iso-level 3"
+else:
+    isoargs = ""
 %>
 
 mkdir images
@@ -48,9 +45,7 @@ install /usr/lib/grub/powerpc-ieee1275/*.lst ${GRUBDIR}/powerpc-ieee1275
 install ${configdir}/grub.cfg.in     ${GRUBDIR}/grub.cfg
 replace @PRODUCT@ '${product.name}'  ${GRUBDIR}/grub.cfg
 replace @VERSION@ ${product.version} ${GRUBDIR}/grub.cfg
-replace @ROOT@    "${rootarg}"       ${GRUBDIR}/grub.cfg
-
-install ${configdir}/mapping ${BOOTDIR}
+replace @ROOT@ 'inst.stage2=hd:LABEL=${isolabel|udev}' ${GRUBDIR}/grub.cfg
 
 ## Install kernel and bootloader config (in separate places for each arch)
 %for kernel in kernels:
@@ -67,13 +62,13 @@ install ${configdir}/mapping ${BOOTDIR}
     treeinfo images-${kernel.arch} zimage
 %endfor
 
-mkdir images/
 # Create optional product.img and updates.img
-<% imggraft=""; images=["product", "updates"] %>
+<% filegraft=""; images=["product", "updates"] %>
 %for img in images:
     %if exists("%s/%s/" % (LORAXDIR, img)):
         installimg ${LORAXDIR}/${img}/ images/${img}.img
-        <% imggraft += " images/{0}.img={1}/images/{0}.img".format(img, outroot) %>
+        treeinfo images-${basearch} ${img}.img images/${img}.img
+        <% filegraft += " images/{0}.img={1}/images/{0}.img".format(img, outroot) %>
     %endif
 %endfor
 
@@ -81,21 +76,27 @@ mkdir images/
 <%
     import os
     if os.path.exists(workdir + "/iso-graft"):
-        imggraft += " " + workdir + "/iso-graft"
+        filegraft += " " + workdir + "/iso-graft"
 %>
 
+# Add the license files
+%for f in glob("/usr/share/licenses/*-release/*"):
+    install ${f} ${f|basename}
+    <% filegraft += " {0}={1}/{0}".format(basename(f), outroot) %>
+%endfor
+
 ## make boot.iso
-runcmd mkisofs -v -U -J -R -T \
+runcmd xorrisofs -v -U -J -R ${isoargs} \
         -o ${outroot}/images/boot.iso \
-        -part -hfs -r -l -sysid PPC \
+        -r -l -sysid PPC \
         -A "${product.name} ${product.version}" -V '${isolabel}' \
         -volset "${product.version}" -volset-size 1 -volset-seqno 1 \
-        -hfs-volid ${product.version} \
-        -chrp-boot -map ${inroot}/${configdir}/mapping \
-        -no-desktop -allow-multidot ${udfargs} -graft-points \
+        -chrp-boot \
+        -graft-points \
+        .discinfo=${outroot}/.discinfo \
         ${BOOTDIR}=${outroot}/${BOOTDIR} \
         ${GRUBDIR}=${outroot}/${GRUBDIR} \
-        ${STAGE2IMG}=${outroot}/${STAGE2IMG} ${imggraft}
+        ${STAGE2IMG}=${outroot}/${STAGE2IMG} ${filegraft}
 
 %for kernel in kernels:
     treeinfo images-${kernel.arch} boot.iso images/boot.iso

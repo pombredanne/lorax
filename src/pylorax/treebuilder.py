@@ -35,8 +35,6 @@ from pylorax.executils import runcmd, runcmd_output, execWithCapture
 templatemap = {
     'i386':    'x86.tmpl',
     'x86_64':  'x86.tmpl',
-    'ppc':     'ppc.tmpl',
-    'ppc64':   'ppc.tmpl',
     'ppc64le': 'ppc64le.tmpl',
     's390':    's390.tmpl',
     's390x':   's390.tmpl',
@@ -70,7 +68,7 @@ def generate_module_info(moddir, outfile=None):
 class RuntimeBuilder(object):
     '''Builds the anaconda runtime image.'''
     def __init__(self, product, arch, dbo, templatedir=None,
-                 installpkgs=None,
+                 installpkgs=None, excludepkgs=None,
                  add_templates=None,
                  add_template_vars=None):
         root = dbo.conf.installroot
@@ -85,6 +83,7 @@ class RuntimeBuilder(object):
         self.add_templates = add_templates or []
         self.add_template_vars = add_template_vars or {}
         self._installpkgs = installpkgs or []
+        self._excludepkgs = excludepkgs or []
         self._runner.defaults = self.vars
         self.dbo.reset()
 
@@ -92,7 +91,8 @@ class RuntimeBuilder(object):
         release = None
         q = self.dbo.sack.query()
         a = q.available()
-        for pkg in a.filter(provides='/etc/system-release'):
+        for pkg in a.filter(provides='system-release'):
+            logger.debug("Found release package %s", pkg)
             if pkg.name.startswith('generic'):
                 continue
             else:
@@ -116,6 +116,8 @@ class RuntimeBuilder(object):
         self._install_branding()
         if len(self._installpkgs) > 0:
             self._runner.installpkg(*self._installpkgs)
+        if len(self._excludepkgs) > 0:
+            self._runner.removepkg(*self._excludepkgs)
         self._runner.run("runtime-install.tmpl")
         for tmpl in self.add_templates:
             self._runner.run(tmpl, **self.add_template_vars)
@@ -205,13 +207,22 @@ class RuntimeBuilder(object):
     def generate_module_data(self):
         root = self.vars.root
         moddir = joinpaths(root, "lib/modules/")
-        for kver in os.listdir(moddir):
-            ksyms = joinpaths(root, "boot/System.map-%s" % kver)
-            logger.info("doing depmod and module-info for %s", kver)
-            runcmd(["depmod", "-a", "-F", ksyms, "-b", root, kver])
-            generate_module_info(moddir+kver, outfile=moddir+"module-info")
+        for kernel in findkernels(root=root):
+            ksyms = joinpaths(root, "boot/System.map-%s" % kernel.version)
+            logger.info("doing depmod and module-info for %s", kernel.version)
+            runcmd(["depmod", "-a", "-F", ksyms, "-b", root, kernel.version])
+            generate_module_info(moddir+kernel.version, outfile=moddir+"module-info")
 
-    def create_runtime(self, outfile="/var/tmp/squashfs.img", compression="xz", compressargs=None, size=2):
+    def create_squashfs_runtime(self, outfile="/var/tmp/squashfs.img", compression="xz", compressargs=None, size=2):
+        """Create a plain squashfs runtime"""
+        compressargs = compressargs or []
+        os.makedirs(os.path.dirname(outfile))
+
+        # squash the rootfs
+        imgutils.mksquashfs(self.vars.root, outfile, compression, compressargs)
+
+    def create_ext4_runtime(self, outfile="/var/tmp/squashfs.img", compression="xz", compressargs=None, size=2):
+        """Create a squashfs compressed ext4 runtime"""
         # make live rootfs image - must be named "LiveOS/rootfs.img" for dracut
         compressargs = compressargs or []
         workdir = joinpaths(os.path.dirname(outfile), "runtime-workdir")
@@ -234,7 +245,8 @@ class RuntimeBuilder(object):
 class TreeBuilder(object):
     '''Builds the arch-specific boot images.
     inroot should be the installtree root (the newly-built runtime dir)'''
-    def __init__(self, product, arch, inroot, outroot, runtime, isolabel, domacboot=True, doupgrade=True, templatedir=None, add_templates=None, add_template_vars=None, workdir=None):
+    def __init__(self, product, arch, inroot, outroot, runtime, isolabel, domacboot=True, doupgrade=True,
+                 templatedir=None, add_templates=None, add_template_vars=None, workdir=None, extra_boot_args=""):
 
         # NOTE: if you pass an arg named "runtime" to a mako template it'll
         # clobber some mako internal variables - hence "runtime_img".
@@ -243,7 +255,8 @@ class TreeBuilder(object):
                                inroot=inroot, outroot=outroot,
                                basearch=arch.basearch, libdir=arch.libdir,
                                isolabel=isolabel, udev=udev_escape, domacboot=domacboot, doupgrade=doupgrade,
-                               workdir=workdir, lower=string_lower)
+                               workdir=workdir, lower=string_lower,
+                               extra_boot_args=extra_boot_args)
         self._runner = LoraxTemplateRunner(inroot, outroot, templatedir=templatedir)
         self._runner.defaults = self.vars
         self.add_templates = add_templates or []
@@ -261,36 +274,37 @@ class TreeBuilder(object):
         If backup is empty, the existing initrd files will be overwritten.
         If suffix is specified, the existing initrd is untouched and a new
         image is built with the filename "${prefix}-${kernel.version}.img"
+
+        If the initrd doesn't exist its name will be created based on the
+        name of the kernel.
         '''
         add_args = add_args or []
         dracut = ["dracut", "--nomdadmconf", "--nolvmconf"] + add_args
         if not backup:
             dracut.append("--force")
 
-        kernels = [kernel for kernel in self.kernels if hasattr(kernel, "initrd")]
-        if not kernels:
-            raise Exception("No initrds found, cannot rebuild_initrds")
+        if not self.kernels:
+            raise Exception("No kernels found, cannot rebuild_initrds")
 
         # Hush some dracut warnings. TODO: bind-mount proc in place?
         open(joinpaths(self.vars.inroot,"/proc/modules"),"w")
-        for kernel in kernels:
+        for kernel in self.kernels:
             if prefix:
-                idir = os.path.dirname(kernel.initrd.path)
+                idir = os.path.dirname(kernel.path)
                 outfile = joinpaths(idir, prefix+'-'+kernel.version+'.img')
-            else:
+            elif hasattr(kernel, "initrd"):
+                # If there is an existing initrd, use that
                 outfile = kernel.initrd.path
+            else:
+                # Construct an initrd from the kernel name
+                outfile = kernel.path.replace("vmlinuz-", "initrd-") + ".img"
             logger.info("rebuilding %s", outfile)
             if backup:
                 initrd = joinpaths(self.vars.inroot, outfile)
-                os.rename(initrd, initrd + backup)
+                if os.path.exists(initrd):
+                    os.rename(initrd, initrd + backup)
             cmd = dracut + [outfile, kernel.version]
             runcmd(cmd, root=self.vars.inroot)
-
-            # ppc64 cannot boot images > 32MiB, check size and warn
-            if self.vars.arch.basearch in ("ppc64", "ppc64le") and os.path.exists(outfile):
-                st = os.stat(outfile)
-                if st.st_size > 32 * 1024 * 1024:
-                    logging.warning("ppc64 initrd %s is > 32MiB", outfile)
 
         os.unlink(joinpaths(self.vars.inroot,"/proc/modules"))
 
